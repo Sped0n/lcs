@@ -1,0 +1,66 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            trusted-users = runner
+            keep-env-derivations = true
+            keep-outputs = true
+            fallback = true
+            builders-use-substitutes = true
+            connect-timeout = 5
+            http-connections = 64
+            max-substitution-jobs = 64
+            substituters = https://cache.nixos.org?priority=10 https://nix-cache.sped0n.com/nix-cache?priority=30 https://nix-community.cachix.org?priority=50 https://cache.numtide.com?priority=70
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= nix-cache.sped0n.com-1:2QjPOhbTs8xHYPpe0tuGIQQ+DFmEZMv05UAfHzU9Crg= nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
+
+      - name: Restore Nix store
+        id: nix-cache-restore
+        uses: nix-community/cache-nix-action/restore@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-store-check-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-store-check-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Resolve Go cache paths
+        id: go-cache
+        run: |
+          echo "modules=$(nix develop -c go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          echo "build=$(nix develop -c go env GOCACHE)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.go-cache.outputs.modules }}
+            ${{ steps.go-cache.outputs.build }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'flake.nix', 'flake.lock') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run prek checks
+        run: nix develop -c prek run --all-files
+
+      - name: Save Nix store
+        if: ${{ always() && steps.nix-cache-restore.outputs.hit-primary-key != 'true' }}
+        uses: nix-community/cache-nix-action/save@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: ${{ steps.nix-cache-restore.outputs.primary-key }}
+          gc-max-store-size: 1024M

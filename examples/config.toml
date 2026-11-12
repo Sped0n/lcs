@@ -1,0 +1,6 @@
+cache_size = "50GB"
+
+cache = [
+  "chip-google-toolchain",
+  "git:https://github.com/myorg/project.git",
+]

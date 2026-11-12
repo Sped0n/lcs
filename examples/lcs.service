@@ -1,0 +1,18 @@
+[Unit]
+Description=LCS Local Cache Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lcsctl serve
+Restart=on-failure
+RestartSec=3
+UMask=0077
+StateDirectory=lcs
+CacheDirectory=lcs
+StateDirectoryMode=0700
+CacheDirectoryMode=0700
+
+[Install]
+WantedBy=default.target
