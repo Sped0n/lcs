@@ -1,6 +1,6 @@
 # Git target
 
-The Git target caches public HTTPS repositories selected by `git:<url>` entries. It uses bare mirrors and the system `git http-backend` command. SSH remotes do not pass through this target.
+The Git target caches public HTTPS repositories selected by `git:<url>` entries. It uses bare mirrors and the system `git http-backend` command. It does not cache SSH remotes.
 
 ## Select repositories
 
@@ -10,14 +10,14 @@ Add each repository to `cache` in the [LCS configuration](../../../README.md#con
 cache_size = "50GB"
 
 cache = [
-  "git:https://github.com/project-chip/connectedhomeip.git",
-  "git:https://github.com/google/pigweed.git",
+    "git:https://github.com/project-chip/connectedhomeip.git",
+    "git:https://pigweed.googlesource.com/pigweed/pigweed.git",
 ]
 ```
 
-Use the same URL spelling in Git commands, including the `.git` suffix. URLs must use HTTPS and must not contain credentials, a query, or a fragment.
+Use the same URL spelling as your Git commands, including the presence or absence of `.git`. Cache entries must use HTTPS on port 443 and have no credentials, query, or fragment. HTTPS remotes on other ports pass through without caching.
 
-Each submodule repository needs its own `git:` entry. LCS does not discover or select more repositories from `.gitmodules`. The `chip-google-toolchain` preset does not select Git repositories.
+Each submodule needs its own `git:` entry. LCS does not discover repositories from `.gitmodules`. The `chip-google-toolchain` target does not select Git repositories.
 
 After you [start LCS and activate your shell](../../../README.md#activate), use your existing commands:
 
@@ -27,28 +27,38 @@ cd connectedhomeip
 git submodule update --init --recursive
 ```
 
-Activation appends repository-specific `url.<base>.insteadOf` rules through `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_N`, and `GIT_CONFIG_VALUE_N`. Git sends matching requests to the loopback HTTP endpoint. Git caching does not need the LCS CA.
+Activation appends `url.<base>.insteadOf` rules through `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_N`, and `GIT_CONFIG_VALUE_N`. Git sends matching requests to the loopback HTTP endpoint. Git caching does not need the LCS CA.
+
+## CHIP on ESP32 and Linux
+
+[examples/config.toml](../../../examples/config.toml) lists connectedhomeip, its larger ESP32 and Linux submodules, and larger nested dependencies.
+
+These are ordinary `git:` entries. Merge the entries you need into your `cache` list. Keep `chip-google-toolchain` if you also want artifact caching. All entries share the same storage budget.
+
+The direct submodule URLs match [connectedhomeip's Git metadata](https://github.com/project-chip/connectedhomeip/blob/4af1c9c61f39d4f6afd81370b3cdca2c5c95d63a/.gitmodules). Other revisions may use different URLs. Check your revision's `.gitmodules` files, including nested submodules, when updating the list.
 
 ## Cache behavior
 
-LCS checks upstream refs for each new clone or fetch advertisement. The check includes tags and HEAD. A cache hit requires the mirror's actual refs to match upstream, not just its stored validation hash. Concurrent requests share validation, and repository locks protect requests to `git http-backend`.
+LCS checks upstream refs for each new clone or fetch advertisement, including tags and HEAD. It compares those refs with the mirror's current refs before counting a hit. Concurrent requests share validation, and repository locks protect requests to `git http-backend`.
 
-On a miss, LCS creates a mirror in staging. To refresh a mirror, it copies the existing mirror to staging and fetches changes there, including objects referenced only by a detached HEAD.
+On a miss, LCS creates a mirror in staging. For a refresh, it copies the existing mirror and fetches changes there. The fetch includes objects referenced only by a detached HEAD.
 
-Before publishing, LCS reads upstream refs again and applies that snapshot's symbolic or detached HEAD. It compares the staged mirror's actual refs with the new snapshot and checks the repository with Git. A mismatch prevents publication and sends the client upstream. Clients never read an incomplete mirror. Upstream can still change after validation.
+Before publishing, LCS reads upstream refs again and sets the staged mirror's symbolic or detached HEAD. It compares the staged refs with that snapshot and checks the repository with Git. If the refs differ, LCS discards the staged mirror and sends the client upstream. Clients never read an incomplete mirror. Upstream can still change after validation.
 
-If upstream validation fails or upstream does not advertise a valid HEAD object, LCS bypasses caching. It does not serve old refs as current. LCS redirects GET and HEAD requests to the original server and forwards POST requests without storing their responses.
+Failed validation or a missing HEAD object causes LCS to bypass caching rather than serve old refs. LCS redirects GET and HEAD requests to the original server. It forwards POST requests without storing their responses.
 
-Requests with authentication or cookies bypass caching. Anonymous mirror fetches do not read your credential helpers, Git configuration, or home-directory credentials. LCS never caches Git Smart HTTP POST responses as HTTP objects.
+Requests with authentication or cookies bypass caching. Anonymous mirror fetches do not read your credential helpers, Git configuration, or home-directory credentials.
 
-Staging files and refresh copies count against the shared storage budget. LCS samples Git's staging growth during downloads and cancels a download if it exceeds its reservation. A Git subprocess can exceed the reservation before the next sample. This check does not replace a filesystem quota.
+Staging and refresh copies count against the shared budget. LCS samples staging growth and cancels a download that exceeds its reservation. Git can exceed the reservation before the next sample. Use a filesystem quota for a hard disk cap.
 
 ## Statistics
 
-A Git hit means the upstream refs matched the cached mirror. A miss means LCS needed to create or refresh the mirror. LCS excludes Git from the traffic-saved counter because it does not measure the upstream pack transfer that a cache hit avoids.
+A hit means upstream refs matched the mirror. A miss means LCS needed to create or refresh it. Git transfers do not contribute to the traffic-saved counter. LCS does not measure the upstream pack transfer avoided by a hit.
 
 ## Tests and limits
 
-Integration tests run Git against HTTP backends over TLS. They cover protocol versions 0 and 2, clone and fetch, tags, default-branch changes, force pushes, shallow and partial clones, selected recursive submodules, and concurrent clones. Freshness regressions cover an upstream change followed by a reversal during download, detached HEAD commits that no branch references, and transitions between detached and symbolic HEAD. A test also checks that a clone completes when clear removes its mirror between requests.
+Integration tests run Git against HTTP backends over TLS. They cover clone and fetch with protocol versions 0 and 2, tags, default-branch changes, and force pushes. They also cover shallow and partial clones, selected recursive submodules, and concurrent clones.
 
-Git LFS requests bypass caching, but LFS and authenticated credential-helper workflows do not have end-to-end integration coverage. Full client compatibility for those workflows remains unverified.
+Freshness tests change and revert upstream refs during a download. They check detached HEAD commits that no branch references and transitions between detached and symbolic HEAD. Another test clears the mirror between a clone's requests and checks that the clone still completes.
+
+Git LFS requests bypass caching. LFS and authenticated credential-helper workflows lack end-to-end tests, so full client compatibility remains unverified.
