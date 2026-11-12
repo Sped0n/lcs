@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,8 +41,8 @@ func PublicDial(ctx context.Context, network, address string) (net.Conn, error) 
 	if err != nil {
 		return nil, err
 	}
-	if port != "80" && port != "443" {
-		return nil, errors.New("only public HTTP and HTTPS ports are allowed")
+	if !validPort(port) {
+		return nil, errors.New("upstream port must be between 1 and 65535")
 	}
 	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
@@ -64,6 +65,11 @@ func PublicDial(ctx context.Context, network, address string) (net.Conn, error) 
 		last = err
 	}
 	return nil, last
+}
+
+func validPort(port string) bool {
+	number, err := strconv.ParseUint(port, 10, 16)
+	return err == nil && number != 0
 }
 
 func PublicIP(address netip.Addr) bool {
@@ -143,8 +149,8 @@ func validateRedirect(ctx context.Context, u *url.URL) error {
 	if u.Scheme != "http" && u.Scheme != "https" || u.User != nil || u.Hostname() == "" {
 		return errors.New("invalid redirect URL")
 	}
-	if port := u.Port(); port != "" && port != "80" && port != "443" {
-		return errors.New("redirect uses a non-HTTP port")
+	if port := u.Port(); port != "" && !validPort(port) {
+		return errors.New("redirect uses an invalid TCP port")
 	}
 	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", u.Hostname())
 	if err != nil {
@@ -174,8 +180,8 @@ func stripHop(header http.Header) {
 
 func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	host, port, err := net.SplitHostPort(r.Host)
-	if err != nil || port != "443" || strings.ContainsAny(host, "/\\@%") {
-		http.Error(w, "CONNECT requires a hostname and port 443", http.StatusBadRequest)
+	if err != nil || host == "" || !validPort(port) || strings.ContainsAny(host, "/\\@%") {
+		http.Error(w, "CONNECT requires a hostname and TCP port between 1 and 65535", http.StatusBadRequest)
 		return
 	}
 	intercept := false
@@ -183,7 +189,7 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		copy := r.Clone(r.Context())
 		copy.Header.Set("Authorization", credentials)
 		username, _, ok := copy.BasicAuth()
-		intercept = ok && username == "lcs-intercept" && p.Intercept != nil && p.Intercept(strings.ToLower(host))
+		intercept = port == "443" && ok && username == "lcs-intercept" && p.Intercept != nil && p.Intercept(strings.ToLower(host))
 	}
 	var leaf tls.Certificate
 	var upstream net.Conn

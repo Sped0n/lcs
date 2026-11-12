@@ -10,12 +10,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/spedon/lcs/internal/cert"
 )
 
 func TestConnectTrustAndSelectiveInterception(t *testing.T) {
-	for _, mode := range []string{"intercept", "untrusted-tunnel", "unsupported-tunnel", "upstream-untrusted"} {
+	for _, mode := range []string{"intercept", "untrusted-tunnel", "unsupported-tunnel", "custom-port-tunnel", "upstream-untrusted"} {
 		t.Run(mode, func(t *testing.T) {
 			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Proxy-Authorization") != "" || r.Header.Get("Authorization") != "Bearer upstream-only" {
@@ -32,7 +33,10 @@ func TestConnectTrustAndSelectiveInterception(t *testing.T) {
 			}
 			p := New(ca)
 			p.Intercept = func(host string) bool { return mode != "unsupported-tunnel" && host == "example.com" }
-			p.Transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			p.Transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				if mode == "custom-port-tunnel" && address != "example.com:6688" {
+					t.Errorf("custom port changed to %q", address)
+				}
 				return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
 			}
 			upstreamRoots := x509.NewCertPool()
@@ -55,8 +59,12 @@ func TestConnectTrustAndSelectiveInterception(t *testing.T) {
 			}
 			transport := &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: clientRoots}}
 			defer transport.CloseIdleConnections()
-			client := &http.Client{Transport: transport}
-			r, _ := http.NewRequest("GET", "https://example.com/artifact", nil)
+			client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+			target := "https://example.com/artifact"
+			if mode == "custom-port-tunnel" {
+				target = "https://example.com:6688/artifact"
+			}
+			r, _ := http.NewRequest("GET", target, nil)
 			r.Header.Set("Authorization", "Bearer upstream-only")
 			response, err := client.Do(r)
 			if err != nil {
