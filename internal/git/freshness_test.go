@@ -14,6 +14,7 @@ func TestRefreshDoesNotKeepAChangedAndRevertedSnapshot(t *testing.T) {
 	f := newFixture(t)
 	t.Setenv("NO_PROXY", "127.0.0.1")
 	t.Setenv("no_proxy", "127.0.0.1")
+
 	original := strings.TrimSpace(gitRun(t, f.work, "rev-parse", "HEAD"))
 	if err := os.WriteFile(filepath.Join(f.work, "file"), []byte("second\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -34,6 +35,7 @@ func TestRefreshDoesNotKeepAChangedAndRevertedSnapshot(t *testing.T) {
 		})
 		return err
 	}
+
 	f.afterFetch = func() error {
 		var err error
 		revertOnce.Do(func() {
@@ -56,18 +58,20 @@ func TestRefreshDoesNotKeepAChangedAndRevertedSnapshot(t *testing.T) {
 	if !advanced.Load() || !reverted.Load() {
 		t.Fatal("upstream did not change and revert during the mirror download")
 	}
+
 	stats, err := f.store.Stats()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Git == 0 || stats.Hits == 0 {
-		t.Fatalf("stable upstream never returned to cached serving: %+v", stats)
+	if stats.Git == 0 || stats.Hits == 0 || stats.Misses != 1 || f.fetches.Load() != 1 {
+		t.Fatalf("stable upstream did not reuse staged work: %+v, fetches=%d", stats, f.fetches.Load())
 	}
 }
 
 func TestRefreshTracksDetachedAndSymbolicHEAD(t *testing.T) {
 	f := newFixture(t)
 	gitRun(t, "", "clone", f.local, filepath.Join(t.TempDir(), "warm"))
+
 	original := strings.TrimSpace(gitRun(t, f.work, "rev-parse", "HEAD"))
 	if err := os.WriteFile(filepath.Join(f.work, "file"), []byte("second\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -91,16 +95,19 @@ func TestRefreshTracksDetachedAndSymbolicHEAD(t *testing.T) {
 			} else {
 				gitRun(t, f.remote, "symbolic-ref", "HEAD", "refs/heads/main")
 			}
+
 			destination := filepath.Join(t.TempDir(), "clone")
 			gitRun(t, "", "clone", f.local, destination)
 			if subject := strings.TrimSpace(gitRun(t, destination, "log", "-1", "--format=%s")); subject != tc.subject {
 				t.Fatalf("HEAD subject=%q; want %q", subject, tc.subject)
 			}
+
 			advertisement := gitRun(t, "", "ls-remote", "--symref", f.local)
 			symbolic := strings.Contains(advertisement, "ref: refs/heads/main\tHEAD\n")
 			if symbolic != (tc.oid == "") {
 				t.Fatalf("incorrect HEAD advertisement: %s", advertisement)
 			}
+
 			head := tc.oid
 			if head == "" {
 				head = original

@@ -38,12 +38,12 @@
               gopls
               gotools
               golangci-lint
-              git
               bash
               zsh
 
               nixfmt
               prek
+              actionlint
             ];
           };
         }

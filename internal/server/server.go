@@ -15,16 +15,29 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spedon/lcs/internal/cert"
 	"github.com/spedon/lcs/internal/config"
-	"github.com/spedon/lcs/internal/proxy"
+	"github.com/spedon/lcs/internal/git"
 	"github.com/spedon/lcs/internal/storage"
-	toolchain "github.com/spedon/lcs/internal/targets/chip-google-toolchain"
-	"github.com/spedon/lcs/internal/targets/git"
 )
 
 func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
-	var err error
+	listener, err := net.Listen("tcp", config.Listen)
+	if err != nil {
+		return err
+	}
+
+	return serve(ctx, c, paths, listener)
+}
+
+func serve(ctx context.Context, c config.Config, paths config.Paths, listener net.Listener) error {
+	defer closeListener(listener)
+
+	address := listener.Addr().String()
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+
 	for _, path := range []string{paths.State, paths.Cache} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return err
@@ -37,10 +50,12 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 			return fmt.Errorf("%s must be a private directory (mode 0700)", path)
 		}
 	}
+
 	paths.State, err = filepath.EvalSymlinks(paths.State)
 	if err != nil {
 		return err
 	}
+
 	paths.Cache, err = filepath.EvalSymlinks(paths.Cache)
 	if err != nil {
 		return err
@@ -48,6 +63,7 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 	if paths.State == paths.Cache || strings.HasPrefix(paths.State, paths.Cache+string(os.PathSeparator)) || strings.HasPrefix(paths.Cache, paths.State+string(os.PathSeparator)) {
 		return errors.New("state and cache directories must not overlap")
 	}
+
 	var locks []*os.File
 	defer func() {
 		for _, file := range locks {
@@ -56,6 +72,7 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 			}
 		}
 	}()
+
 	for _, dir := range []string{paths.State, paths.Cache} {
 		file, err := os.OpenFile(filepath.Join(dir, "service.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
@@ -66,10 +83,7 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 			return fmt.Errorf("another service owns %s: %w", dir, err)
 		}
 	}
-	ca, err := cert.Ensure(paths.State)
-	if err != nil {
-		return err
-	}
+
 	store, err := storage.Open(paths.State, paths.Cache, c.Limit)
 	if err != nil {
 		return err
@@ -79,18 +93,7 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 			log.Printf("close metadata: %v", err)
 		}
 	}()
-	p := proxy.New(ca)
-	defer p.Close()
-	if c.Toolchain {
-		artifacts := toolchain.New(store, p.Transport)
-		p.Artifacts = artifacts
-		p.Intercept = artifacts.Preset.Intercept
-	}
-	listener, err := net.Listen("tcp", config.Listen)
-	if err != nil {
-		return err
-	}
-	defer closeListener(listener)
+
 	socket := filepath.Join(paths.State, "control.sock")
 	if err := os.Remove(socket); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -103,6 +106,7 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 	if err := os.Chmod(socket, 0o600); err != nil {
 		return err
 	}
+
 	api := http.NewServeMux()
 	api.HandleFunc("GET /shell", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -110,6 +114,7 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 			log.Printf("shell configuration response: %v", err)
 		}
 	})
+
 	api.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		stats, err := store.Stats()
 		if err != nil {
@@ -122,6 +127,7 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 			log.Printf("status response: %v", err)
 		}
 	})
+
 	api.HandleFunc("POST /clear", func(w http.ResponseWriter, r *http.Request) {
 		if err := store.Clear(); err != nil {
 			http.Error(w, "cache clear failed", 500)
@@ -130,34 +136,39 @@ func Serve(ctx context.Context, c config.Config, paths config.Paths) error {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	gitcache, err := git.New(c, store, p)
+
+	gitcache, err := git.New(c, store, nil)
 	if err != nil {
 		return err
 	}
+	defer gitcache.Close()
+
 	publicHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !r.URL.IsAbs() && strings.HasPrefix(r.URL.Path, "/git/") && r.Method != http.MethodConnect {
-			if r.Host != config.Listen && r.Host != "localhost:7777" {
+			if r.Host != address && r.Host != net.JoinHostPort("localhost", port) {
 				http.Error(w, "invalid local host", http.StatusBadRequest)
 				return
 			}
 			gitcache.ServeHTTP(w, r)
 			return
 		}
-		p.ServeHTTP(w, r)
+		http.NotFound(w, r)
 	})
+
 	public := &http.Server{Handler: publicHandler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 64 << 10, BaseContext: func(net.Listener) context.Context { return ctx }}
 	private := &http.Server{Handler: api, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 5 * time.Second, BaseContext: func(net.Listener) context.Context { return ctx }}
+
 	failures := make(chan error, 2)
 	go func() { failures <- public.Serve(listener) }()
 	go func() { failures <- private.Serve(control) }()
-	log.Printf("listening on %s", config.Listen)
+	log.Printf("listening on %s", address)
 	select {
 	case <-ctx.Done():
 	case err = <-failures:
 	}
+
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p.Close()
 	shutdownErr := errors.Join(public.Shutdown(shutdown), private.Shutdown(shutdown))
 	if shutdownErr != nil {
 		shutdownErr = errors.Join(shutdownErr, public.Close(), private.Close())
@@ -193,27 +204,32 @@ func ShellConfig(ctx context.Context, paths config.Paths) (config.Config, error)
 	if err != nil {
 		return c, fmt.Errorf("service is not available: %w", err)
 	}
+
 	defer func() {
 		if err := response.Body.Close(); err != nil {
 			log.Printf("close shell configuration response: %v", err)
 		}
 	}()
+
 	if response.StatusCode != http.StatusOK {
 		return c, fmt.Errorf("service returned %s", response.Status)
 	}
 	if err := json.NewDecoder(response.Body).Decode(&c); err != nil {
 		return c, fmt.Errorf("read daemon configuration: %w", err)
 	}
+
 	return c, nil
 }
 
 func Control(ctx context.Context, paths config.Paths, action string, output io.Writer) error {
 	client := controlClient(paths)
 	defer client.CloseIdleConnections()
+
 	method := http.MethodGet
 	if action == "clear" {
 		method = http.MethodPost
 	}
+
 	request, err := http.NewRequestWithContext(ctx, method, "http://lcs/"+action, nil)
 	if err != nil {
 		return err
@@ -231,17 +247,26 @@ func Control(ctx context.Context, paths config.Paths, action string, output io.W
 			log.Printf("close control response: %v", err)
 		}
 	}()
+
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("service returned %s", response.Status)
 	}
+
 	if action == "clear" {
 		_, err := fmt.Fprintln(output, "Cache cleared; active entries will be removed when released.")
 		return err
 	}
+
 	var stats storage.Stats
 	if err := json.NewDecoder(response.Body).Decode(&stats); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(output, "LCS\nService: running\nCache: %.1f GB / %.1f GB\n\nGit: %.1f GB\nGoogle toolchain: %.1f GB\nTemporary: %.1f GB\n\nHits: %d\nMisses: %d\nTraffic saved: %.1f GB\n", float64(stats.Git+stats.Toolchain+stats.Temporary)/1e9, float64(stats.Limit)/1e9, float64(stats.Git)/1e9, float64(stats.Toolchain)/1e9, float64(stats.Temporary)/1e9, stats.Hits, stats.Misses, float64(stats.Saved)/1e9)
+
+	legacy := ""
+	if stats.Legacy > 0 {
+		legacy = fmt.Sprintf("Legacy cache: %.1f GB\n", float64(stats.Legacy)/1e9)
+	}
+
+	_, err = fmt.Fprintf(output, "LCS\nService: running\nCache: %.1f GB / %.1f GB\n\nGit: %.1f GB\n%sTemporary: %.1f GB\n\nHits: %d\nMisses: %d\n", float64(stats.Git+stats.Legacy+stats.Temporary)/1e9, float64(stats.Limit)/1e9, float64(stats.Git)/1e9, legacy, float64(stats.Temporary)/1e9, stats.Hits, stats.Misses)
 	return err
 }

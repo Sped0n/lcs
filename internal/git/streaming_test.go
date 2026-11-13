@@ -51,11 +51,13 @@ func TestPassthroughReportsTruncatedChunkedResponse(t *testing.T) {
 				}
 			}))
 			defer upstream.Close()
+
 			transport := upstream.Client().Transport.(*http.Transport).Clone()
 			transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
 			}
 			defer transport.CloseIdleConnections()
+
 			store, err := storage.Open(t.TempDir(), filepath.Join(t.TempDir(), "cache"), 10000)
 			if err != nil {
 				t.Fatal(err)
@@ -65,15 +67,21 @@ func TestPassthroughReportsTruncatedChunkedResponse(t *testing.T) {
 					t.Error(err)
 				}
 			}()
-			cache, err := New(config.Config{}, store, transport)
+
+			cache, err := New(config.Config{Repositories: []string{"https://example.com/owner/repo.git"}}, store, transport)
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer cache.Close()
+
 			server := httptest.NewServer(cache)
 			defer server.Close()
+
 			client := &http.Client{Timeout: 3 * time.Second}
 			defer client.CloseIdleConnections()
+
 			response, requestErr := client.Post(server.URL+"/git/example.com/owner/repo.git/info/lfs/objects/batch", "application/json", strings.NewReader("{}"))
+
 			var body []byte
 			var bodyErr error
 			if requestErr == nil {

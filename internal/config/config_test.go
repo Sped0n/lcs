@@ -11,7 +11,7 @@ func TestLoad(t *testing.T) {
 		name, text string
 		valid      bool
 	}{
-		{"valid", "cache_size = '1.5GB'\ncache = ['chip-google-toolchain', 'git:https://github.com/a/b.git']", true},
+		{"valid", "cache_size = '1.5GB'\ncache = ['git:https://github.com/a/b.git']", true},
 		{"unknown key", "cache_size = '1GB'\nworkers = 2", false},
 		{"internal field", "cache_size = '1GB'\nLimit = 9", false},
 		{"binary units", "cache_size = '1GiB'", false},
@@ -26,11 +26,12 @@ func TestLoad(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.text), 0o600); err != nil {
 				t.Fatal(err)
 			}
+
 			c, err := Load(path)
 			if (err == nil) != tc.valid {
 				t.Fatalf("Load: %v", err)
 			}
-			if tc.valid && (c.Limit != 1500000000 || !c.Toolchain || len(c.Repositories) != 1) {
+			if tc.valid && (c.Limit != 1500000000 || len(c.Repositories) != 1) {
 				t.Fatalf("config: %+v", c)
 			}
 		})
@@ -44,6 +45,7 @@ func TestPaths(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
 	t.Setenv("STATE_DIRECTORY", filepath.Join(base, "systemd-state"))
 	t.Setenv("CACHE_DIRECTORY", filepath.Join(base, "systemd-cache"))
+
 	p, err := ResolvePaths()
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +53,7 @@ func TestPaths(t *testing.T) {
 	if p.State != filepath.Join(base, "systemd-state") || p.Cache != filepath.Join(base, "systemd-cache") {
 		t.Fatalf("paths: %+v", p)
 	}
+
 	t.Setenv("CACHE_DIRECTORY", p.State)
 	if _, err := ResolvePaths(); err == nil {
 		t.Fatal("accepted overlapping state and cache")

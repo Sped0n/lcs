@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/spedon/lcs/internal/config"
-	"github.com/spedon/lcs/internal/proxy"
 	"github.com/spedon/lcs/internal/storage"
 )
 
@@ -30,10 +29,26 @@ type fixture struct {
 	store               *storage.Store
 	work, local, remote string
 	fetches             atomic.Int64
+	downloaded          atomic.Int64
 	slow                atomic.Bool
 	hooksMu             sync.Mutex
 	afterRefs           func() error
 	afterFetch          func() error
+}
+
+type countedResponse struct {
+	http.ResponseWriter
+	bytes *atomic.Int64
+}
+
+func (w countedResponse) Write(data []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(data)
+	w.bytes.Add(int64(n))
+	return n, err
+}
+
+func (w countedResponse) Flush() {
+	w.ResponseWriter.(http.Flusher).Flush()
 }
 
 func gitRun(t *testing.T, dir string, args ...string) string {
@@ -44,11 +59,29 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 	if err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
 	}
+
 	return string(out)
 }
 
 func newFixture(t *testing.T, repositories ...string) *fixture {
 	t.Helper()
+
+	// Git hooks pass repository paths that must not affect fixture repositories.
+	for _, value := range os.Environ() {
+		name, previous, _ := strings.Cut(value, "=")
+		if !strings.HasPrefix(name, "GIT_") {
+			continue
+		}
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.Setenv(name, previous); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+
 	t.Setenv("GIT_CONFIG_COUNT", "0")
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -56,8 +89,10 @@ func newFixture(t *testing.T, repositories ...string) *fixture {
 	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.com")
 	t.Setenv("GIT_COMMITTER_NAME", "Test")
 	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.com")
+
 	root := t.TempDir()
 	work := filepath.Join(root, "work")
+
 	gitRun(t, root, "init", "-b", "main", work)
 	if err := os.WriteFile(filepath.Join(work, "file"), []byte("first\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -65,17 +100,20 @@ func newFixture(t *testing.T, repositories ...string) *fixture {
 	gitRun(t, work, "add", ".")
 	gitRun(t, work, "commit", "-m", "first")
 	gitRun(t, work, "tag", "v1")
+
 	upstreamRoot := filepath.Join(root, "upstream")
 	if err := os.MkdirAll(filepath.Join(upstreamRoot, "owner"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	remotePath := filepath.Join(upstreamRoot, "owner", "repo.git")
 	gitRun(t, root, "clone", "--bare", work, remotePath)
+
 	binary, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
 	}
 	f := &fixture{work: work, remote: remotePath}
+
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if f.slow.Load() {
 			time.Sleep(50 * time.Millisecond)
@@ -95,6 +133,7 @@ func newFixture(t *testing.T, repositories ...string) *fixture {
 		refs := bytes.Contains(body, []byte("command=ls-refs\n")) || r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") && !strings.Contains(r.Header.Get("Git-Protocol"), "version=2")
 		if fetch {
 			f.fetches.Add(1)
+			w = countedResponse{w, &f.downloaded}
 		}
 		f.hooksMu.Lock()
 		var afterResponse func() error
@@ -128,20 +167,20 @@ func newFixture(t *testing.T, repositories ...string) *fixture {
 		}
 	}))
 	t.Cleanup(upstream.Close)
+
 	caPath := filepath.Join(root, "roots.pem")
 	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw}), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GIT_SSL_CAINFO", caPath)
-	p := proxy.New(nil)
 	roots := x509.NewCertPool()
 	roots.AddCert(upstream.Certificate())
-	p.Transport.TLSClientConfig = &tls.Config{RootCAs: roots, ServerName: "example.com"}
-	p.Transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+
+	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "example.com"}}
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
 	}
-	proxyServer := httptest.NewServer(p)
-	t.Cleanup(func() { p.Close(); proxyServer.Close() })
+
 	state := filepath.Join(root, "state")
 	if err := os.MkdirAll(state, 0o700); err != nil {
 		t.Fatal(err)
@@ -155,19 +194,24 @@ func newFixture(t *testing.T, repositories ...string) *fixture {
 			t.Error(err)
 		}
 	})
-	f.cache, err = New(config.Config{Repositories: append([]string{"https://example.com/owner/repo.git"}, repositories...)}, f.store, p)
+
+	f.cache, err = New(config.Config{Repositories: append([]string{"https://example.com/owner/repo.git"}, repositories...)}, f.store, transport)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.cache.proxyURL = proxyServer.URL
+	t.Cleanup(f.cache.Close)
+	t.Setenv("https_proxy", f.cache.proxyURL)
+
 	local := httptest.NewServer(f.cache)
 	t.Cleanup(local.Close)
 	f.local = local.URL + "/git/example.com/owner/repo.git"
+
 	return f
 }
 
 func TestCloneFetchAndProtocols(t *testing.T) {
 	f := newFixture(t)
+
 	for _, protocol := range []string{"0", "2"} {
 		dest := filepath.Join(t.TempDir(), "clone")
 		gitRun(t, "", "-c", "protocol.version="+protocol, "clone", f.local, dest)
@@ -175,6 +219,7 @@ func TestCloneFetchAndProtocols(t *testing.T) {
 			t.Fatal(got)
 		}
 	}
+
 	stats, err := f.store.Stats()
 	if err != nil {
 		t.Fatal(err)
@@ -182,6 +227,7 @@ func TestCloneFetchAndProtocols(t *testing.T) {
 	if stats.Git == 0 || stats.Hits < 1 || stats.Misses != 1 {
 		t.Fatalf("stats: %+v", stats)
 	}
+
 	if err := os.WriteFile(filepath.Join(f.work, "file"), []byte("second\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -192,6 +238,7 @@ func TestCloneFetchAndProtocols(t *testing.T) {
 	if got := gitRun(t, clone, "log", "-1", "--format=%s"); strings.TrimSpace(got) != "second" {
 		t.Fatal(got)
 	}
+
 	gitRun(t, f.work, "checkout", "-b", "next")
 	gitRun(t, f.work, "push", f.remote, "next")
 	gitRun(t, f.remote, "symbolic-ref", "HEAD", "refs/heads/next")
@@ -200,6 +247,7 @@ func TestCloneFetchAndProtocols(t *testing.T) {
 	if got := gitRun(t, clone, "branch", "--show-current"); strings.TrimSpace(got) != "next" {
 		t.Fatal(got)
 	}
+
 	gitRun(t, f.work, "checkout", "main")
 	gitRun(t, f.work, "reset", "--hard", "v1")
 	gitRun(t, f.work, "push", "--force", f.remote, "main")
@@ -211,22 +259,41 @@ func TestCloneFetchAndProtocols(t *testing.T) {
 
 func TestShallowAndPartialClone(t *testing.T) {
 	f := newFixture(t)
+	gitRun(t, f.remote, "config", "uploadpack.allowFilter", "true")
+
 	shallow := filepath.Join(t.TempDir(), "shallow")
 	gitRun(t, "", "clone", "--depth=1", f.local, shallow)
 	if got := gitRun(t, shallow, "rev-parse", "--is-shallow-repository"); strings.TrimSpace(got) != "true" {
 		t.Fatal(got)
 	}
-	partial := filepath.Join(t.TempDir(), "partial")
-	gitRun(t, "", "clone", "--filter=blob:none", "--no-checkout", f.local, partial)
-	gitRun(t, partial, "checkout", "main")
-	if data, err := os.ReadFile(filepath.Join(partial, "file")); err != nil || string(data) != "first\n" {
-		t.Fatalf("partial checkout: %q %v", data, err)
+	before, err := f.store.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"cold", "warm"} {
+		if mode == "warm" {
+			gitRun(t, "", "clone", f.local, filepath.Join(t.TempDir(), "full"))
+		}
+
+		partial := filepath.Join(t.TempDir(), "partial-"+mode)
+		gitRun(t, "", "clone", "--filter=blob:none", "--no-checkout", f.local, partial)
+		gitRun(t, partial, "checkout", "main")
+		if data, err := os.ReadFile(filepath.Join(partial, "file")); err != nil || string(data) != "first\n" {
+			t.Fatalf("partial checkout: %q %v", data, err)
+		}
+		if mode == "cold" {
+			after, err := f.store.Stats()
+			if err != nil || after.Git != before.Git {
+				t.Fatalf("cold filtered clone downloaded a full mirror: %+v, %v", after, err)
+			}
+		}
 	}
 }
 
 func TestConcurrentClones(t *testing.T) {
 	f := newFixture(t)
 	f.slow.Store(true)
+
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	failures := make(chan string, 8)
@@ -240,9 +307,11 @@ func TestConcurrentClones(t *testing.T) {
 			}
 		})
 	}
+
 	close(start)
 	wg.Wait()
 	close(failures)
+
 	for failure := range failures {
 		t.Error(failure)
 	}
@@ -253,6 +322,7 @@ func TestConcurrentClones(t *testing.T) {
 
 func TestAuthenticationAndUnselectedRedirect(t *testing.T) {
 	f := newFixture(t)
+
 	for _, tc := range []struct{ path, auth string }{
 		{"/git/example.com/owner/repo.git/info/refs?service=git-upload-pack", "Basic c2VjcmV0"},
 		{"/git/example.com/owner/other.git/info/refs?service=git-upload-pack", ""},
@@ -266,6 +336,7 @@ func TestAuthenticationAndUnselectedRedirect(t *testing.T) {
 			t.Fatalf("bypass: %d %s", w.Code, w.Body.String())
 		}
 	}
+
 	stats, err := f.store.Stats()
 	if err != nil {
 		t.Fatal(err)

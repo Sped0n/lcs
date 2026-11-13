@@ -5,7 +5,6 @@ go 1.26.0
 require (
 	github.com/BurntSushi/toml v1.6.0
 	golang.org/x/sync v0.20.0
-	golang.org/x/term v0.42.0
 	modernc.org/sqlite v1.50.1
 )
 

@@ -1,7 +1,6 @@
 cache_size = "50GB"
 
 cache = [
-    "chip-google-toolchain",
     "git:https://github.com/project-chip/connectedhomeip.git",
 
     # Shared ESP32 and Linux dependencies.
